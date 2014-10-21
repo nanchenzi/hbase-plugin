@@ -1,0 +1,1033 @@
+package org.apache.phoenix.hbase.index.balancer;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.Set;
+import java.util.Map.Entry;
+import java.util.concurrent.ConcurrentHashMap;
+
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.ClusterStatus;
+import org.apache.hadoop.hbase.HBaseIOException;
+import org.apache.hadoop.hbase.HRegionInfo;
+import org.apache.hadoop.hbase.HTableDescriptor;
+import org.apache.hadoop.hbase.ServerLoad;
+import org.apache.hadoop.hbase.ServerName;
+import org.apache.hadoop.hbase.TableName;
+import org.apache.hadoop.hbase.io.ImmutableBytesWritable;
+import org.apache.hadoop.hbase.master.LoadBalancer;
+import org.apache.hadoop.hbase.master.MasterServices;
+import org.apache.hadoop.hbase.master.RegionPlan;
+import org.apache.hadoop.hbase.master.RegionState;
+import org.apache.hadoop.hbase.master.RegionStates;
+import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+import org.apache.hadoop.util.ReflectionUtils;
+import org.apache.hadoop.hbase.master.HMaster;
+import org.apache.hadoop.hbase.master.balancer.BaseLoadBalancer;
+import org.apache.hadoop.hbase.master.balancer.StochasticLoadBalancer;
+
+/**
+ * 
+ * @author ly
+ * 
+ *         <p>
+ *         自定义LoadBalancer策略，目的在于达到不同应用场景之间的表级regionserver隔离,并且与phoenix结合，保证
+            分组的同时索引表数据也在同一个组内
+ *         </p>
+ * 
+ *         <ul>
+ *         <li>hbase-loadbalancer.xml添加配置属性</li>
+ *         <li>loadbalancer.regionserver.group regionServer的分组名称</li>
+ *         <li>loadbalancer.regionserver.group.mapping.组名称 该组内包含的regionserver</li>
+ *         <li>loadbalancer.table.group.mapping.组名称 该组内拥有哪些表</li>
+ *         <li>loadbalancer.table.regionserver.default 未分配的组的表默认存放的rs</li>
+ *         </ul>
+ * 
+ *         <ul>
+ *         <li>一个组内至少拥有三个rs，当组内没有有效的regionserver
+ *         则不进行loadbalancer，当rs下线后默认会把region random到所有节点上</li>
+ *         <li>一张表仅能属于一个组，未分配组的表默认迁移到default的regionserver上</li>
+ *         <li>当有region在分配的组之外或者未分配组的region不在default
+ *         region上，则先将超出的范围的region以随机的方式迁回所在的组或者default regionserver上</li>
+ *         <li>当所有的region在自己的组内或者default
+ *         regionserver上运行，则分别对组内的server采用stochasticLoadBalancer进行load balancer</li>
+ *         </ul>
+ * 
+ *         <ul>
+ *         <li><name>hbase.master.loadbalancer.class</name> 自定义loadbalancer接口参数</li>
+ *         <li><name>hbase.balancer.period</name> balancer运行周期时间 改为半个小时进行一次
+ *         1800000</li>
+ *         <li><name>hbase.master.loadbalance.bytable</name>
+ *         误将该参数开启，不采用表级的loadbalancer</li>
+ *         </ul>
+ * 
+ */
+
+public class IndexLoadBalancer implements LoadBalancer {
+
+	private static final Log LOG = LogFactory.getLog(IndexLoadBalancer.class);
+
+	private static final String GROUP_NAME = "loadbalancer.regionserver.group";
+	private static final String RS_GROUP_MAPPING_PREFIX_NAME = "loadbalancer.regionserver.group.mapping.";
+	private static final String TABLE_GROUP_MAPPING_PREFIX_NAME = "loadbalancer.table.group.mapping.";
+	private static final String TABLE_TO_REGIONSERVER_DEFAULT = "loadbalancer.table.regionserver.default";
+
+	private static final Random RANDOM_FUNC = new Random(
+			EnvironmentEdgeManager.currentTimeMillis());
+	private Configuration config = null;
+	private StochasticLoadBalancer stochasticLoadBalancer = null;
+
+	private Map<String, List<String>> groupMappingRS; // rs组对应的regionserver名称的映射关系
+	private Map<String, List<ServerName>> groupMappingServerName; // rs组对应的ServerName的映射关系
+	private Map<String, String> tableToGroupMapping; // table分配至rsGroup的映射
+	private Map<String, List<String>> groupToTableMapping; // group至分配的table的映射关系
+	private Set<ServerName> assignRegionServer; // have assign regionserver
+
+	private List<String> unAssignTables; // 未分配Group的表
+	private List<String> unKnowRegionServer; // 集群中不存在的regionserveer
+	private List<String> unConfigRegionSever; // 配置文件中不存在的regionserver
+	private List<String> unKnowTable; // 未知的table表集合
+	private ServerName defaultServerName; // backup的regionserver用于存储未分配的表
+	private ServerName backUpRegionServer;
+
+	// LoadBalancer interface param
+	private Configuration conf;
+	protected MasterServices services;
+	private volatile boolean stopped = false;
+
+	// phoenix need var
+	public static final byte[] PARENT_TABLE_KEY = Bytes.toBytes("PARENT_TABLE");
+	Map<TableName, TableName> userTableVsIndexTable = new HashMap<TableName, TableName>();
+	Map<TableName, TableName> indexTableVsUserTable = new HashMap<TableName, TableName>();
+	private static final Random RANDOM = new Random(
+			EnvironmentEdgeManager.currentTimeMillis());
+
+	/**
+	 * Maintains colocation information of user regions and corresponding index
+	 * regions.
+	 */
+	private Map<TableName, Map<ImmutableBytesWritable, ServerName>> colocationInfo = new ConcurrentHashMap<TableName, Map<ImmutableBytesWritable, ServerName>>();
+
+	@Override
+	public void initialize() throws HBaseIOException {
+		stochasticLoadBalancer = ReflectionUtils.newInstance(
+				StochasticLoadBalancer.class, this.getConf());
+		stochasticLoadBalancer.setClusterStatus(((HMaster) this.services)
+				.getClusterStatus());
+		stochasticLoadBalancer.setMasterServices(this.services);
+		try {
+			this.stochasticLoadBalancer.initialize();
+		} catch (HBaseIOException e) {
+			// TODO Auto-generated catch block
+			LOG.error("init stochasticLoadBalancer error!");
+			LOG.error(e.getMessage());
+		}
+
+		try {
+			populateTablesToColocate(this.services.getTableDescriptors()
+					.getAll());
+		} catch (IOException e) {
+			throw new HBaseIOException(e);
+		}
+	}
+
+	@Override
+	public Configuration getConf() {
+		return conf;
+	}
+
+	@Override
+	public void setConf(Configuration configuration) {
+		this.conf = configuration;
+	}
+
+	@Override
+	public void setClusterStatus(ClusterStatus st) {
+
+	}
+
+	public Map<TableName, Map<ImmutableBytesWritable, ServerName>> getColocationInfo() {
+		return colocationInfo;
+	}
+
+	@Override
+	public void setMasterServices(MasterServices masterServices) {
+		this.services = masterServices;
+	}
+
+	@Override
+	public List<RegionPlan> balanceCluster(
+			Map<ServerName, List<HRegionInfo>> clusterState)
+			throws HBaseIOException {
+		// TODO Auto-generated method stub
+
+		if (stochasticLoadBalancer == null) {
+		}
+
+		long startTime = EnvironmentEdgeManager.currentTimeMillis();
+		reloadConfigCollections();
+
+		// 加载config配置
+		try {
+			config = loadbalancerConfig();
+		} catch (Exception e) {
+			LOG.warn(e.getMessage() + "\n  loadbalancerConfig should have {"
+					+ GROUP_NAME + "," + RS_GROUP_MAPPING_PREFIX_NAME + ","
+					+ TABLE_GROUP_MAPPING_PREFIX_NAME + ","
+					+ TABLE_TO_REGIONSERVER_DEFAULT + "} config property");
+			return null;
+		}
+
+		// 添加regionserver分组名称
+		for (String groupName : config.get(GROUP_NAME).split(",")) {
+			groupMappingRS.put(groupName, new ArrayList<String>());
+		}
+		if (groupMappingRS.isEmpty()) {
+			LOG.warn("loadbalancerConfig rsGroup is empty!");
+			return null;
+		}
+
+		// 添加regionserver至分组中，每组至少有三台机器
+		for (String groupName : groupMappingRS.keySet()) {
+			String rsToGroupMappingKey = RS_GROUP_MAPPING_PREFIX_NAME
+					+ groupName;
+			if (config.get(rsToGroupMappingKey) == null) {
+				LOG.warn("loadbalancerConfig group : " + rsToGroupMappingKey
+						+ " config is missing!");
+				return null;
+			}
+			for (String rsName : config.get(rsToGroupMappingKey).split(",")) {
+				groupMappingRS.get(groupName).add(rsName);
+			}
+			if (groupMappingRS.get(groupName).size() < 3) {
+				LOG.warn("loadbalancerConfig  " + groupName
+						+ "group must have at least three regionserver");
+				return null;
+			}
+
+		}
+
+		// 添加group to serverName mapping
+		Map<String, ServerName> hostNameToServerNameMapping = getHostNameToServerNameMapping(this.services
+				.getServerManager().getOnlineServers());
+		for (String groupName : groupMappingRS.keySet()) {
+			List<ServerName> serverNameList = new ArrayList<ServerName>();
+			for (String rsName : groupMappingRS.get(groupName)) {
+				ServerName serverName = hostNameToServerNameMapping.get(rsName);
+				if (serverName == null) {
+					unKnowRegionServer.add(rsName);
+					continue;
+				}
+				if (assignRegionServer.contains(serverName)) {
+					LOG.warn("loadbalancerConfig  " + serverName.getHostname()
+							+ " have assign to a group, can't assign again!");
+					return null;
+				}
+				assignRegionServer.add(serverName);
+				serverNameList.add(serverName);
+			}
+			if (serverNameList.size() == 0) {
+				LOG.warn("loadbalancerConfig  "
+						+ groupName
+						+ " group have no live regionServer, refused to do loadBalancer!");
+				return null;
+
+			}
+			groupMappingServerName.put(groupName, serverNameList);
+		}
+
+		// 添加表对应的rs组的mapping
+		for (String groupName : groupMappingRS.keySet()) {
+			String groupContainsTableKey = TABLE_GROUP_MAPPING_PREFIX_NAME
+					+ groupName;
+			if (config.get(groupContainsTableKey) == null) {
+				LOG.warn("loadbalancerConfig tableMappingGroup : "
+						+ groupContainsTableKey + " config is missing!");
+				return null;
+			}
+			List<String> tableNameList = new ArrayList<String>();
+			for (String tableName : config.get(groupContainsTableKey)
+					.split(",")) {
+				tableNameList.add(tableName);
+				if (tableToGroupMapping.get(tableName) != null) {
+					LOG.warn("loadbalancerConfig  " + tableName
+							+ " have been assign to a group ,check the config!");
+					return null;
+				}
+				tableToGroupMapping.put(tableName, groupName);
+			}
+			groupToTableMapping.put(groupName, tableNameList);
+		}
+
+		// 添加defaultServerName
+		if (config.get(TABLE_TO_REGIONSERVER_DEFAULT) == null) {
+			LOG.warn("loadbalancerConfig should have { "
+					+ TABLE_TO_REGIONSERVER_DEFAULT + "} config property");
+		}
+		for (String defaultRegionServerName : config.get(
+				TABLE_TO_REGIONSERVER_DEFAULT).split(",")) {
+			defaultServerName = hostNameToServerNameMapping
+					.get(defaultRegionServerName);
+			if (defaultServerName != null) {
+				break;
+			}
+		}
+		if (defaultServerName == null) {
+			LOG.warn("defaultServerName have no  right ServerName or no online serverName, refused to load balancer!");
+			return null;
+		}
+
+		List<RegionPlan> plans = new LinkedList<RegionPlan>();
+
+		// 验证loadbalancer是否outofbound
+		boolean haveTableOutOfBound = false;
+		for (ServerName localServerName : clusterState.keySet()) {
+			List<HRegionInfo> listRegion = clusterState.get(localServerName);
+			if (!assignRegionServer.contains(localServerName)) {
+				unConfigRegionSever.add(localServerName.getServerName());
+			}
+			for (HRegionInfo region : listRegion) {
+				String tableName = null;
+				// ph index table mapping to user table
+				if (indexTableVsUserTable.containsKey(region.getTable())) {
+					tableName = indexTableVsUserTable.get(region.getTable())
+							.getNameAsString();
+				} else {
+					tableName = region.getTable().getNameAsString();
+				}
+				String groupName = tableToGroupMapping.get(tableName);
+
+				if (groupName == null || "".equals(groupName)) {
+					// 属于未被分配groupName的表,判断是否在default regionserver上
+					if (localServerName.equals(defaultServerName))
+						continue;
+					haveTableOutOfBound = true;
+					unAssignTables.add(tableName);
+					addRegionPlan(plans, region, localServerName,
+							defaultServerName);
+					continue;
+				}
+
+				List<ServerName> groupHaveServerNameList = groupMappingServerName
+						.get(groupName);
+				boolean justInGroupServerNameList = false; // 表是否在分配的组内
+				for (ServerName groupPeerServerName : groupHaveServerNameList) {
+					if (groupPeerServerName.equals(localServerName))
+						justInGroupServerNameList = true;
+				}
+				if (!justInGroupServerNameList) {
+					haveTableOutOfBound = true;
+					addRegionPlan(plans, region, localServerName,
+							randomPickRegionServer(groupHaveServerNameList));
+				}
+
+			}
+		}
+
+		if (haveTableOutOfBound) {
+			long endTime = EnvironmentEdgeManager.currentTimeMillis();
+			printLoadBalancerHelpMessage();
+			LOG.info("Do a TableOutOfBound loadBalancer! Calculated a load balance in "
+					+ (endTime - startTime)
+					+ "ms. "
+					+ "Moving "
+					+ plans.size()
+					+ " region ! ");
+
+			return plans;
+		}
+
+		// do group StochasticLoadBalancer
+		Map<ServerName, List<HRegionInfo>> groupClusterState = null;
+
+		for (String groupName : groupMappingServerName.keySet()) {
+			groupClusterState = new HashMap<ServerName, List<HRegionInfo>>();
+			List<ServerName> serverNameList = groupMappingServerName
+					.get(groupName);
+			for (ServerName serverNameKey : serverNameList) {
+				groupClusterState.put(serverNameKey,
+						clusterState.get(serverNameKey));
+			}
+			/*
+			 * List<RegionPlan> stochasticPlan = stochasticLoadBalancer
+			 * .balanceCluster(groupClusterState);
+			 */
+			List<RegionPlan> stochasticPlan = doGroupPhenixBalancer(groupClusterState);
+			if (stochasticPlan == null || stochasticPlan.size() == 1) {
+				LOG.warn("stochasticLoadBalancer has no RegionPlan to move!");
+			} else {
+				plans.addAll(stochasticPlan);
+			}
+
+		}
+
+		long endTime = EnvironmentEdgeManager.currentTimeMillis();
+		printLoadBalancerHelpMessage();
+		LOG.info("Do a groupStochastic loadBalancer! Calculated a load balance in "
+				+ (endTime - startTime)
+				+ "ms. "
+				+ "Moving "
+				+ plans.size()
+				+ " region ! ");
+
+		return plans;
+	}
+
+	/**
+	 * 组内的ph索引表和用户表负载均衡
+	 * 
+	 * @param clusterState
+	 * @return
+	 */
+	private List<RegionPlan> doGroupPhenixBalancer(
+			Map<ServerName, List<HRegionInfo>> clusterState) {
+		TableName tableName = null;
+		List<RegionPlan> regionPlans = null;
+		Map<ServerName, List<HRegionInfo>> userClusterState = new HashMap<ServerName, List<HRegionInfo>>();
+		Map<ServerName, List<HRegionInfo>> indexClusterState = new HashMap<ServerName, List<HRegionInfo>>();
+		for (Entry<ServerName, List<HRegionInfo>> serverVsRegionList : clusterState
+				.entrySet()) {
+			ServerName sn = serverVsRegionList.getKey();
+			List<HRegionInfo> regionsInfos = serverVsRegionList.getValue();
+			List<HRegionInfo> idxRegionsToBeMoved = new ArrayList<HRegionInfo>();
+			List<HRegionInfo> userRegionsToBeMoved = new ArrayList<HRegionInfo>();
+			for (HRegionInfo hri : regionsInfos) {
+				if (hri.isMetaRegion()) {
+					continue;
+				}
+				tableName = hri.getTable();
+				// Check and modify the colocation info map based on values of
+				// cluster state
+				// because we
+				// will
+				// call balancer only when the cluster is in stable and reliable
+				// state.
+				if (isTableColocated(tableName)) {
+					// table name may change every time thats why always need to
+					// get table
+					// entries.
+					Map<ImmutableBytesWritable, ServerName> tableKeys = this.colocationInfo
+							.get(tableName);
+					if (tableKeys != null) {
+						updateServer(tableKeys, sn, hri);
+					}
+				}
+				if (indexTableVsUserTable.containsKey(tableName)) {
+					idxRegionsToBeMoved.add(hri);
+					continue;
+				}
+				userRegionsToBeMoved.add(hri);
+			}
+			// there may be dummy entries here if assignments by table is set
+			userClusterState.put(sn, userRegionsToBeMoved);
+			indexClusterState.put(sn, idxRegionsToBeMoved);
+		}
+
+		regionPlans = this.stochasticLoadBalancer
+				.balanceCluster(userClusterState);
+		if (regionPlans == null) {
+			if (LOG.isDebugEnabled()) {
+				LOG.debug("User region plan is null.");
+			}
+			regionPlans = new ArrayList<RegionPlan>();
+		} else {
+			updateRegionPlans(regionPlans);
+		}
+		return prepareRegionPlansForClusterState(indexClusterState, regionPlans);
+	}
+
+	/**
+	 * Creates a Configuration with hbase-loadbalancer.xml resources
+	 * 
+	 * @return a Configuration with hbase-loadbalancer.xml resources
+	 */
+	private static Configuration loadbalancerConfig() throws Exception {
+		Configuration conf = new Configuration();
+		conf.addResource("hbase-loadbalancer.xml");
+
+		if (conf.get(GROUP_NAME) == null
+				|| conf.get(TABLE_TO_REGIONSERVER_DEFAULT) == null)
+			throw new Exception(
+					"loadbalancerConfig is missing some config property.");
+		return conf;
+	}
+
+	/**
+	 * get hostname to serverName mapping map
+	 * 
+	 * @param onlineServers
+	 * @return
+	 */
+	private static Map<String, ServerName> getHostNameToServerNameMapping(
+			Map<ServerName, ServerLoad> onlineServers) {
+		Map<String, ServerName> mapping = new HashMap<String, ServerName>();
+		for (ServerName serverName : onlineServers.keySet()) {
+			mapping.put(serverName.getHostname(), serverName);
+		}
+		return mapping;
+	}
+
+	private void reloadConfigCollections() {
+		groupMappingRS = new HashMap<String, List<String>>();
+		groupMappingServerName = new HashMap<String, List<ServerName>>();
+		assignRegionServer = new HashSet<ServerName>();
+		tableToGroupMapping = new HashMap<String, String>();
+		groupToTableMapping = new HashMap<String, List<String>>();
+		defaultServerName = null;
+
+		unKnowRegionServer = new ArrayList<String>();
+		unConfigRegionSever = new ArrayList<String>();
+		unAssignTables = new ArrayList<String>();
+		unKnowTable = new ArrayList<String>();
+		backUpRegionServer = null;
+	}
+
+	private List<RegionPlan> addRegionPlan(List<RegionPlan> plans,
+			HRegionInfo regionInfo, ServerName sourceServerName,
+			ServerName destServerName) {
+		RegionPlan rp = new RegionPlan(regionInfo, sourceServerName,
+				destServerName);
+		plans.add(rp);
+		return plans;
+	}
+
+	private ServerName randomPickRegionServer(List<ServerName> listRS) {
+		if (listRS.size() == 1)
+			return listRS.get(0);
+		return listRS.get(Math.abs(RANDOM_FUNC.nextInt()) % listRS.size());
+	}
+
+	private void printLoadBalancerHelpMessage() {
+		StringBuilder builder = new StringBuilder();
+		builder.append("unKnowRegionServer size is ").append(
+				unKnowRegionServer.size());
+		if (unKnowRegionServer.size() > 0)
+			builder.append(Arrays.toString(unKnowRegionServer.toArray()));
+		builder.append("; unConfigRegionSever size is ").append(
+				unConfigRegionSever.size());
+		if (unConfigRegionSever.size() > 0)
+			builder.append(Arrays.toString(unConfigRegionSever.toArray()));
+		builder.append("; unAssignTables size is ").append(
+				unAssignTables.size());
+		if (unAssignTables.size() > 0)
+			builder.append(Arrays.toString(unAssignTables.toArray()));
+
+		LOG.info(builder.toString());
+	}
+
+	/**
+	 * phoenix table need function
+	 */
+
+	/**
+	 * Add tables whose regions to co-locate.
+	 * 
+	 * @param userTable
+	 * @param indexTable
+	 */
+	public void addTablesToColocate(TableName userTable, TableName indexTable) {
+		if (userTable.equals(indexTable)) {
+			throw new IllegalArgumentException(
+					"Tables to colocate should not be same.");
+		} else if (isTableColocated(userTable)) {
+			throw new IllegalArgumentException(
+					"User table already colocated with table "
+							+ getMappedTableToColocate(userTable));
+		} else if (isTableColocated(indexTable)) {
+			throw new IllegalArgumentException(
+					"Index table is already colocated with table "
+							+ getMappedTableToColocate(indexTable));
+		}
+		userTableVsIndexTable.put(userTable, indexTable);
+		indexTableVsUserTable.put(indexTable, userTable);
+	}
+
+	/**
+	 * Removes the specified table and corresponding table from co-location.
+	 * 
+	 * @param table
+	 */
+	public void removeTablesFromColocation(TableName table) {
+		TableName other = userTableVsIndexTable.remove(table);
+		if (other != null) {
+			indexTableVsUserTable.remove(other);
+		} else {
+			other = indexTableVsUserTable.remove(table);
+			if (other != null)
+				userTableVsIndexTable.remove(table);
+		}
+	}
+
+	public boolean isTableColocated(TableName table) {
+		return userTableVsIndexTable.containsKey(table)
+				|| indexTableVsUserTable.containsKey(table);
+	}
+
+	/**
+	 * Return mapped table to co-locate.
+	 * 
+	 * @param tableName
+	 * @return index table if the specified table is user table or vice versa.
+	 */
+	public TableName getMappedTableToColocate(TableName tableName) {
+		TableName other = userTableVsIndexTable.get(tableName);
+		return other == null ? indexTableVsUserTable.get(tableName) : other;
+	}
+
+	public void populateTablesToColocate(
+			Map<String, HTableDescriptor> tableDescriptors) {
+		HTableDescriptor desc = null;
+		for (Entry<String, HTableDescriptor> entry : tableDescriptors
+				.entrySet()) {
+			desc = entry.getValue();
+			if (desc.getValue(PARENT_TABLE_KEY) != null) {
+				addTablesToColocate(
+						TableName.valueOf(desc.getValue(PARENT_TABLE_KEY)),
+						desc.getTableName());
+			}
+		}
+	}
+
+	/**
+	 * Populates table's region locations into co-location info from master.
+	 * 
+	 * @param table
+	 */
+	public void populateRegionLocations(TableName table) {
+		synchronized (this.colocationInfo) {
+			if (!isTableColocated(table)) {
+				throw new IllegalArgumentException("Specified table " + table
+						+ " should be in one of the tables to co-locate.");
+			}
+			RegionStates regionStates = this.services.getAssignmentManager()
+					.getRegionStates();
+			List<HRegionInfo> onlineRegions = regionStates
+					.getRegionsOfTable(table);
+			for (HRegionInfo hri : onlineRegions) {
+				regionOnline(hri, regionStates.getRegionServerOfRegion(hri));
+			}
+			Map<String, RegionState> regionsInTransition = regionStates
+					.getRegionsInTransition();
+			for (RegionState regionState : regionsInTransition.values()) {
+				if (table.equals(regionState.getRegion().getTable())
+						&& regionState.getServerName() != null) {
+					regionOnline(regionState.getRegion(),
+							regionState.getServerName());
+				}
+			}
+		}
+	}
+
+	@Override
+	public boolean isStopped() {
+		return stopped;
+	}
+
+	@Override
+	public void stop(String why) {
+		LOG.info("Load Balancer stop requested: " + why);
+		stopped = true;
+	}
+
+	@Override
+	public void regionOffline(HRegionInfo regionInfo) {
+		TableName tableName = regionInfo.getTable();
+		synchronized (this.colocationInfo) {
+			Map<ImmutableBytesWritable, ServerName> tableKeys = this.colocationInfo
+					.get(tableName);
+			if (null == tableKeys) {
+				if (LOG.isDebugEnabled()) {
+					LOG.debug("No regions of table " + tableName
+							+ " in the colocationInfo.");
+				}
+			} else {
+				tableKeys.remove(new ImmutableBytesWritable(regionInfo
+						.getStartKey()));
+				if (LOG.isDebugEnabled()) {
+					LOG.debug("The regioninfo " + regionInfo
+							+ " removed from the colocationInfo");
+				}
+			}
+		}
+	}
+
+	public void clearTableRegionPlans(TableName tableName) {
+		if (LOG.isDebugEnabled()) {
+			LOG.debug("Clearing regions plans from colocationInfo for table "
+					+ tableName);
+		}
+		synchronized (this.colocationInfo) {
+			this.colocationInfo.remove(tableName);
+		}
+	}
+
+	@Override
+	public void regionOnline(HRegionInfo regionInfo, ServerName sn) {
+		TableName tableName = regionInfo.getTable();
+		synchronized (this.colocationInfo) {
+			Map<ImmutableBytesWritable, ServerName> tabkeKeys = this.colocationInfo
+					.get(tableName);
+			if (tabkeKeys == null) {
+				tabkeKeys = new ConcurrentHashMap<ImmutableBytesWritable, ServerName>();
+				this.colocationInfo.put(tableName, tabkeKeys);
+			}
+			tabkeKeys.put(new ImmutableBytesWritable(regionInfo.getStartKey()),
+					sn);
+		}
+	}
+
+	private ServerName getServerNameFromMap(HRegionInfo regionInfo,
+			List<ServerName> onlineServers) {
+		TableName tableName = regionInfo.getTable();
+		TableName mappedTable = getMappedTableToColocate(regionInfo.getTable());
+		ImmutableBytesWritable startKey = new ImmutableBytesWritable(
+				regionInfo.getStartKey());
+		synchronized (this.colocationInfo) {
+			Map<ImmutableBytesWritable, ServerName> correspondingTableKeys = this.colocationInfo
+					.get(mappedTable);
+			Map<ImmutableBytesWritable, ServerName> actualTableKeys = this.colocationInfo
+					.get(tableName);
+
+			if (null != correspondingTableKeys) {
+				if (correspondingTableKeys.containsKey(startKey)) {
+					ServerName previousServer = null;
+					if (null != actualTableKeys) {
+						previousServer = actualTableKeys.get(startKey);
+					}
+					ServerName sn = correspondingTableKeys.get(startKey);
+					if (null != previousServer) {
+						// if servername of index region and user region are
+						// same in colocationInfo
+						// clean
+						// previous plans and return null
+						if (previousServer.equals(sn)) {
+							correspondingTableKeys.remove(startKey);
+							actualTableKeys.remove(startKey);
+							if (LOG.isDebugEnabled()) {
+								LOG.debug("Both user region plan and corresponding index region plan "
+										+ "in colocation info are same. Hence clearing the plans to select new plan"
+										+ " for the region "
+										+ regionInfo.getRegionNameAsString()
+										+ ".");
+							}
+							return null;
+						}
+					}
+					if (sn != null && onlineServers.contains(sn)) {
+						if (LOG.isDebugEnabled()) {
+							LOG.debug("Updating the region plan of the region "
+									+ regionInfo.getRegionNameAsString()
+									+ " with server " + sn);
+						}
+						regionOnline(regionInfo, sn);
+						return sn;
+					} else if (sn != null) {
+						if (LOG.isDebugEnabled()) {
+							LOG.debug("The location "
+									+ sn
+									+ " of region with start key"
+									+ Bytes.toStringBinary(regionInfo
+											.getStartKey())
+									+ " is not in online. Selecting other region server.");
+						}
+						return null;
+					}
+				}
+			} else {
+				if (LOG.isDebugEnabled()) {
+					LOG.debug("No region plans in colocationInfo for table "
+							+ mappedTable);
+				}
+			}
+			return null;
+		}
+	}
+
+	private ServerName getRandomServer(HRegionInfo regionInfo,
+			List<ServerName> servers) throws HBaseIOException {
+		ServerName sn = null;
+		sn = this.stochasticLoadBalancer.randomAssignment(regionInfo, servers);
+		if (sn == null)
+			return null;
+		regionOnline(regionInfo, sn);
+		return sn;
+	}
+
+	@Override
+	public ServerName randomAssignment(HRegionInfo regionInfo,
+			List<ServerName> servers) throws HBaseIOException {
+		if (!isTableColocated(regionInfo.getTable())) {
+			return this.stochasticLoadBalancer.randomAssignment(regionInfo,
+					servers);
+		}
+		ServerName sn = getServerNameFromMap(regionInfo, servers);
+		if (sn == null) {
+			if (LOG.isDebugEnabled()) {
+				LOG.debug("No server found for region "
+						+ regionInfo.getRegionNameAsString() + '.');
+			}
+			sn = getRandomServer(regionInfo, servers);
+		}
+		if (LOG.isDebugEnabled()) {
+			LOG.debug("Destination server for region "
+					+ regionInfo.getRegionNameAsString() + " is "
+					+ ((sn == null) ? "null" : sn.toString()) + '.');
+		}
+		return sn;
+	}
+
+	@Override
+	public Map<HRegionInfo, ServerName> immediateAssignment(
+			List<HRegionInfo> regions, List<ServerName> servers)
+			throws HBaseIOException {
+		return this.stochasticLoadBalancer
+				.immediateAssignment(regions, servers);
+	}
+
+	private void updateServer(
+			Map<ImmutableBytesWritable, ServerName> tableKeys, ServerName sn,
+			HRegionInfo hri) {
+		ImmutableBytesWritable startKey = new ImmutableBytesWritable(
+				hri.getStartKey());
+		ServerName existingServer = tableKeys.get(startKey);
+		if (!sn.equals(existingServer)) {
+			if (LOG.isDebugEnabled()) {
+				LOG.debug("There is a mismatch in the existing server name for the region "
+						+ hri
+						+ ".  Replacing the server "
+						+ existingServer
+						+ " with " + sn + ".");
+			}
+			tableKeys.put(startKey, sn);
+		}
+	}
+
+	/**
+	 * Prepare region plans for cluster state
+	 * 
+	 * @param clusterState
+	 *            if balancing is table wise then cluster state contains only
+	 *            indexed or index table regions, otherwise it contains all
+	 *            index tables regions.
+	 * @param regionPlans
+	 * @return
+	 */
+	private List<RegionPlan> prepareRegionPlansForClusterState(
+			Map<ServerName, List<HRegionInfo>> clusterState,
+			List<RegionPlan> regionPlans) {
+		if (regionPlans == null)
+			regionPlans = new ArrayList<RegionPlan>();
+		ImmutableBytesWritable startKey = new ImmutableBytesWritable();
+		for (Entry<ServerName, List<HRegionInfo>> serverVsRegionList : clusterState
+				.entrySet()) {
+			List<HRegionInfo> regionInfos = serverVsRegionList.getValue();
+			ServerName server = serverVsRegionList.getKey();
+			for (HRegionInfo regionInfo : regionInfos) {
+				if (!isTableColocated(regionInfo.getTable()))
+					continue;
+				TableName mappedTableName = getMappedTableToColocate(regionInfo
+						.getTable());
+				startKey.set(regionInfo.getStartKey());
+				ServerName sn = this.colocationInfo.get(mappedTableName).get(
+						startKey);
+				if (sn.equals(server)) {
+					continue;
+				} else {
+					RegionPlan rp = new RegionPlan(regionInfo, server, sn);
+					if (LOG.isDebugEnabled()) {
+						LOG.debug("Selected server " + rp.getDestination()
+								+ " as destination for region "
+								+ regionInfo.getRegionNameAsString()
+								+ " from colocation info.");
+					}
+					regionOnline(regionInfo, rp.getDestination());
+					regionPlans.add(rp);
+				}
+			}
+		}
+		return regionPlans;
+	}
+
+	private void updateRegionPlans(List<RegionPlan> regionPlans) {
+		for (RegionPlan regionPlan : regionPlans) {
+			HRegionInfo hri = regionPlan.getRegionInfo();
+			if (!isTableColocated(hri.getTable()))
+				continue;
+			if (LOG.isDebugEnabled()) {
+				LOG.debug("Saving region plan of region "
+						+ hri.getRegionNameAsString() + '.');
+			}
+			regionOnline(hri, regionPlan.getDestination());
+		}
+	}
+
+	@Override
+	public Map<ServerName, List<HRegionInfo>> roundRobinAssignment(
+			List<HRegionInfo> regions, List<ServerName> servers)
+			throws HBaseIOException {
+		List<HRegionInfo> userRegions = new ArrayList<HRegionInfo>();
+		List<HRegionInfo> indexRegions = new ArrayList<HRegionInfo>();
+		for (HRegionInfo hri : regions) {
+			seperateUserAndIndexRegion(hri, userRegions, indexRegions);
+		}
+		Map<ServerName, List<HRegionInfo>> bulkPlan = null;
+		if (!userRegions.isEmpty()) {
+			bulkPlan = this.stochasticLoadBalancer.roundRobinAssignment(
+					userRegions, servers);
+			// This should not happen.
+			if (null == bulkPlan) {
+				if (LOG.isDebugEnabled()) {
+					LOG.debug("No region plans selected for user regions in roundRobinAssignment.");
+				}
+				return null;
+			}
+			savePlan(bulkPlan);
+		}
+		bulkPlan = prepareIndexRegionsPlan(indexRegions, bulkPlan, servers);
+		return bulkPlan;
+	}
+
+	private void seperateUserAndIndexRegion(HRegionInfo hri,
+			List<HRegionInfo> userRegions, List<HRegionInfo> indexRegions) {
+		if (indexTableVsUserTable.containsKey(hri.getTable())) {
+			indexRegions.add(hri);
+			return;
+		}
+		userRegions.add(hri);
+	}
+
+	private Map<ServerName, List<HRegionInfo>> prepareIndexRegionsPlan(
+			List<HRegionInfo> indexRegions,
+			Map<ServerName, List<HRegionInfo>> bulkPlan,
+			List<ServerName> servers) throws HBaseIOException {
+		if (null != indexRegions && !indexRegions.isEmpty()) {
+			if (null == bulkPlan) {
+				bulkPlan = new ConcurrentHashMap<ServerName, List<HRegionInfo>>();
+			}
+			for (HRegionInfo hri : indexRegions) {
+				if (LOG.isDebugEnabled()) {
+					LOG.debug("Preparing region plan for index region "
+							+ hri.getRegionNameAsString() + '.');
+				}
+				ServerName destServer = getDestServerForIdxRegion(hri);
+				List<HRegionInfo> destServerRegions = null;
+				if (destServer == null)
+					destServer = this.randomAssignment(hri, servers);
+				if (destServer != null) {
+					destServerRegions = bulkPlan.get(destServer);
+					if (null == destServerRegions) {
+						destServerRegions = new ArrayList<HRegionInfo>();
+						bulkPlan.put(destServer, destServerRegions);
+					}
+					if (LOG.isDebugEnabled()) {
+						LOG.debug("Server " + destServer
+								+ " selected for region "
+								+ hri.getRegionNameAsString() + '.');
+					}
+					destServerRegions.add(hri);
+					regionOnline(hri, destServer);
+				}
+			}
+		}
+		return bulkPlan;
+	}
+
+	private ServerName getDestServerForIdxRegion(HRegionInfo hri) {
+		// Every time we calculate the table name because in case of master
+		// restart the index
+		// regions
+		// may be coming for different index tables.
+		TableName actualTable = getMappedTableToColocate(hri.getTable());
+		ImmutableBytesWritable startkey = new ImmutableBytesWritable(
+				hri.getStartKey());
+		synchronized (this.colocationInfo) {
+
+			Map<ImmutableBytesWritable, ServerName> tableKeys = colocationInfo
+					.get(actualTable);
+			if (null == tableKeys) {
+				// Can this case come
+				return null;
+			}
+			if (tableKeys.containsKey(startkey)) {
+				// put index region location if corresponding user region found
+				// in regionLocation
+				// map.
+				ServerName sn = tableKeys.get(startkey);
+				regionOnline(hri, sn);
+				return sn;
+			}
+		}
+		return null;
+	}
+
+	private void savePlan(Map<ServerName, List<HRegionInfo>> bulkPlan) {
+		synchronized (this.colocationInfo) {
+			for (Entry<ServerName, List<HRegionInfo>> e : bulkPlan.entrySet()) {
+				if (LOG.isDebugEnabled()) {
+					LOG.debug("Saving user regions' plans for server "
+							+ e.getKey() + '.');
+				}
+				for (HRegionInfo hri : e.getValue()) {
+					if (!isTableColocated(hri.getTable()))
+						continue;
+					regionOnline(hri, e.getKey());
+				}
+				if (LOG.isDebugEnabled()) {
+					LOG.debug("Saved user regions' plans for server "
+							+ e.getKey() + '.');
+				}
+			}
+		}
+	}
+
+	@Override
+	public Map<ServerName, List<HRegionInfo>> retainAssignment(
+			Map<HRegionInfo, ServerName> regions, List<ServerName> servers)
+			throws HBaseIOException {
+		Map<HRegionInfo, ServerName> userRegionsMap = new ConcurrentHashMap<HRegionInfo, ServerName>();
+		List<HRegionInfo> indexRegions = new ArrayList<HRegionInfo>();
+		for (Entry<HRegionInfo, ServerName> e : regions.entrySet()) {
+			seperateUserAndIndexRegion(e, userRegionsMap, indexRegions, servers);
+		}
+		Map<ServerName, List<HRegionInfo>> bulkPlan = null;
+		if (!userRegionsMap.isEmpty()) {
+			bulkPlan = this.stochasticLoadBalancer.retainAssignment(
+					userRegionsMap, servers);
+			if (bulkPlan == null) {
+				if (LOG.isDebugEnabled()) {
+					LOG.debug("Empty region plan for user regions.");
+				}
+				return null;
+			}
+			savePlan(bulkPlan);
+		}
+		bulkPlan = prepareIndexRegionsPlan(indexRegions, bulkPlan, servers);
+		return bulkPlan;
+	}
+
+	private void seperateUserAndIndexRegion(Entry<HRegionInfo, ServerName> e,
+			Map<HRegionInfo, ServerName> userRegionsMap,
+			List<HRegionInfo> indexRegions, List<ServerName> servers) {
+		HRegionInfo hri = e.getKey();
+		if (indexTableVsUserTable.containsKey(hri.getTable())) {
+			indexRegions.add(hri);
+			return;
+		}
+		if (e.getValue() == null) {
+			userRegionsMap
+					.put(hri, servers.get(RANDOM.nextInt(servers.size())));
+		} else {
+			userRegionsMap.put(hri, e.getValue());
+		}
+	}
+}
